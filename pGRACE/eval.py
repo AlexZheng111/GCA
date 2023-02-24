@@ -38,7 +38,7 @@ def get_idx_split(dataset, split, preload_split):
     else:
         raise RuntimeError(f'Unknown split type {split}')
 
-
+# TODO: Pass the preloaded splits into this
 def log_regression(z,
                    dataset,
                    evaluator,

@@ -3,9 +3,12 @@ import argparse
 import os.path as osp
 import random
 import nni
+import matplotlib.pyplot as plt
 
 import torch
+import torch.nn.functional as F
 from torch_geometric.utils import dropout_adj, degree, to_undirected
+from torch_geometric.data import Data
 
 from simple_param.sp import SimpleParam
 from pGRACE.model import Encoder, GRACE
@@ -17,6 +20,9 @@ from pGRACE.eval import log_regression, MulticlassEvaluator
 from pGRACE.utils import get_base_model, get_activation, \
     generate_split, compute_pr, eigenvector_centrality
 from pGRACE.dataset import get_dataset
+from pGRACE.util_xgoal import *
+from GPUtil import showUtilization as gpu_usage
+import gc, functools
 
 
 def train():
@@ -45,11 +51,12 @@ def train():
     z1 = model(x_1, edge_index_1)
     z2 = model(x_2, edge_index_2)
 
-    loss = model.loss(z1, z2, batch_size=1024 if args.dataset == 'Coauthor-Phy' else None)
+    # TODO: The embeddings need to be added to the loss return
+    loss, h1, h2 = model.loss(z1, z2, batch_size=1024 if args.dataset == 'Coauthor-Phy' else None)
     loss.backward()
     optimizer.step()
 
-    return loss.item()
+    return loss.item(), h1, h2
 
 
 def test(final=False):
@@ -125,75 +132,217 @@ if __name__ == '__main__':
 
     device = torch.device(args.device)
 
-    path = osp.expanduser('~/datasets')
-    path = osp.join(path, args.dataset)
-    dataset = get_dataset(path, args.dataset)
+    ### --------------------------
+    # Get the multiplex dataset
+    ### --------------------------
+    if args.dataset == "dblp":
+        adj_list, features, labels, idx_train, idx_val, idx_test = load_dblp()
+    if args.dataset == "acm":
+        adj_list, features, labels, idx_train, idx_val, idx_test = load_acm_mat()
+    if args.dataset == "imdb":
+        adj_list, features, labels, idx_train, idx_val, idx_test = load_imdb()
+    if args.dataset == "amazon":
+        adj_list, features, labels, idx_train, idx_val, idx_test = load_amazon()
 
-    data = dataset[0]
-    data = data.to(device)
-
-    # generate split
-    split = generate_split(data.num_nodes, train_ratio=0.1, val_ratio=0.1)
-
-    if args.save_split:
-        torch.save(split, args.save_split)
-    elif args.load_split:
-        split = torch.load(args.load_split)
-
-    encoder = Encoder(dataset.num_features, param['num_hidden'], get_activation(param['activation']),
-                      base_model=get_base_model(param['base_model']), k=param['num_layers']).to(device)
-    model = GRACE(encoder, param['num_hidden'], param['num_proj_hidden'], param['tau']).to(device)
-    optimizer = torch.optim.Adam(
-        model.parameters(),
-        lr=param['learning_rate'],
-        weight_decay=param['weight_decay']
-    )
-
-    if param['drop_scheme'] == 'degree':
-        drop_weights = degree_drop_weights(data.edge_index).to(device)
-    elif param['drop_scheme'] == 'pr':
-        drop_weights = pr_drop_weights(data.edge_index, aggr='sink', k=200).to(device)
-    elif param['drop_scheme'] == 'evc':
-        drop_weights = evc_drop_weights(data).to(device)
+    if args.dataset == "dblp":
+        features = preprocess_features_dblp(features)
     else:
-        drop_weights = None
+        features = preprocess_features(features)
 
-    if param['drop_scheme'] == 'degree':
-        edge_index_ = to_undirected(data.edge_index)
-        node_deg = degree(edge_index_[1])
-        if args.dataset == 'WikiCS':
-            feature_weights = feature_drop_weights_dense(data.x, node_c=node_deg).to(device)
+    nb_nodes = adj_list[0].shape[0]
+    ft_size = features.shape[1]
+    nb_classes = labels.shape[1]
+
+    gpu_usage()
+
+    adj_list = [normalize_adj(adj) for adj in adj_list]
+    adj_list = [torch.FloatTensor(adj) for adj in adj_list]
+    features = torch.FloatTensor(features)
+    labels = torch.FloatTensor(labels).to(args.device)
+    idx_train = torch.LongTensor(idx_train).to(args.device)
+    idx_val = torch.LongTensor(idx_val).to(args.device)
+    idx_test = torch.LongTensor(idx_test).to(args.device)
+
+    features = features.to(args.device)
+    adj_list = [adj.to(args.device) for adj in adj_list]
+    adj_list = adj_list[2:]
+    n_adj = len(adj_list)
+    gpu_usage()
+    
+    # --------------- Original Dataset Gathering ------------------
+    # path = osp.expanduser('~/datasets')
+    # path = osp.join(path, args.dataset)
+    # dataset = get_dataset(path, args.dataset)
+
+    # data = dataset[0]
+    # data = data.to(device)
+
+    # # generate split
+    # split = generate_split(data.num_nodes, train_ratio=0.1, val_ratio=0.1)
+
+    # if args.save_split:
+    #     torch.save(split, args.save_split)
+    # elif args.load_split:
+    #     split = torch.load(args.load_split)
+    # -------------------------------------------------------------
+
+    ### ------------- Begin my Training ---------------------------
+    similarities = []
+    for i, adj in enumerate(adj_list):
+        # gpu_usage()
+        edge_index = adj.nonzero().t().contiguous()
+        data = Data(x=features, edge_index=edge_index)
+        encoder = Encoder(ft_size, param['num_hidden'], get_activation(param['activation']),
+                          base_model=get_base_model(param['base_model']), k=param['num_layers']).to(device)
+        model = GRACE(encoder, param['num_hidden'], param['num_proj_hidden'], param['tau']).to(device)
+        optimizer = torch.optim.Adam(model.parameters(), 
+                                     lr=param['learning_rate'], 
+                                     weight_decay=param['weight_decay'])
+        # gpu_usage()
+        # Determine drop scheme
+        if param['drop_scheme'] == 'degree':
+            drop_weights = degree_drop_weights(data.edge_index).to(device)
+        elif param['drop_scheme'] == 'pr':
+            drop_weights = pr_drop_weights(data.edge_index, aggr='sink', k=200).to(device)
+        elif param['drop_scheme'] == 'evc':
+            drop_weights = evc_drop_weights(data).to(device)
+
+        if param['drop_scheme'] == 'degree':
+            edge_index_ = to_undirected(data.edge_index)
+            node_deg = degree(edge_index_[1])
+            if args.dataset == 'WikiCS':
+                feature_weights = feature_drop_weights_dense(data.x, node_c=node_deg).to(device)
+            else:
+                feature_weights = feature_drop_weights(data.x, node_c=node_deg).to(device)
+        elif param['drop_scheme'] == 'pr':
+            node_pr = compute_pr(data.edge_index)
+            if args.dataset == 'WikiCS':
+                feature_weights = feature_drop_weights_dense(data.x, node_c=node_pr).to(device)
+            else:
+                feature_weights = feature_drop_weights(data.x, node_c=node_pr).to(device)
+        elif param['drop_scheme'] == 'evc':
+            node_evc = eigenvector_centrality(data)
+            if args.dataset == 'WikiCS':
+                feature_weights = feature_drop_weights_dense(data.x, node_c=node_evc).to(device)
+            else:
+                feature_weights = feature_drop_weights(data.x, node_c=node_evc).to(device)
         else:
-            feature_weights = feature_drop_weights(data.x, node_c=node_deg).to(device)
-    elif param['drop_scheme'] == 'pr':
-        node_pr = compute_pr(data.edge_index)
-        if args.dataset == 'WikiCS':
-            feature_weights = feature_drop_weights_dense(data.x, node_c=node_pr).to(device)
-        else:
-            feature_weights = feature_drop_weights(data.x, node_c=node_pr).to(device)
-    elif param['drop_scheme'] == 'evc':
-        node_evc = eigenvector_centrality(data)
-        if args.dataset == 'WikiCS':
-            feature_weights = feature_drop_weights_dense(data.x, node_c=node_evc).to(device)
-        else:
-            feature_weights = feature_drop_weights(data.x, node_c=node_evc).to(device)
-    else:
-        feature_weights = torch.ones((data.x.size(1),)).to(device)
+            feature_weights = torch.ones((data.x.size(1),)).to(device)
 
-    log = args.verbose.split(',')
+        log = args.verbose.split(',')
+        # gpu_usage()
+        for epoch in range(1, param['num_epochs'] + 1):
+            loss, h1, h2 = train()
+            if 'train' in log:
+                print(f'(T) | Epoch={epoch:03d}, loss={loss:.4f}')
 
-    for epoch in range(1, param['num_epochs'] + 1):
-        loss = train()
-        if 'train' in log:
-            print(f'(T) | Epoch={epoch:03d}, loss={loss:.4f}')
+            if epoch % 100 == 0:
+                acc = test()
 
-        if epoch % 100 == 0:
-            acc = test()
+                if 'eval' in log:
+                    print(f'(E) | Epoch={epoch:04d}, avg_acc = {acc}')
+        # gpu_usage()
+        with torch.no_grad():
+            h1 = F.normalize(h1, dim=1)
+            h2 = F.normalize(h2, dim=1)
+            sims = torch.mm(h1, h2.t())
+            labels_index = labels.argmax(axis=1)
+            arbitrary_node = 0
+            class_arb_node = labels_index[arbitrary_node].item()
+            arb_node_sims = sims[:,arbitrary_node]
+            arb_node_sims_split = [arb_node_sims[labels_index == class_arb_node].detach().cpu().numpy(), 
+                                arb_node_sims[labels_index != class_arb_node].detach().cpu().numpy()]
+            arb_node_sims = arb_node_sims.detach().cpu().numpy()
+            similarities = similarities + arb_node_sims_split
+            print("GPU Usage before emptying cache")
+            gpu_usage()
+            del h1, h2
+            del sims, labels_index, arb_node_sims
+        # # Delete the models and other unused variables
+        # model.apply(model.weight_init)
+        # encoder.apply(model.weight_init)
+        del model, encoder, optimizer, data, edge_index, edge_index_, node_deg, drop_weights, feature_weights
+        # adj_list[i] = None
+        # torch.cuda.empty_cache()
+        # print("GPU Usage after emptying cache")
+        # gpu_usage()
+        # for obj in gc.get_objects():
+        #     try:
+        #         if torch.is_tensor(obj) or (hasattr(obj, 'data') and torch.is_tensor(obj.data)):
+        #             print(type(obj), obj.size())
+        #     except:
+        #         pass
+    plt.hist(similarities, bins=100, density=True, alpha=0.8, label=['TN1', 'FN2', 'TN2', 'FN2', 'TN3', 'FN3'])
+    plt.legend()
+    plt.xlabel('Cosine Similarity')
+    plt.ylabel('Density')
+    plt.show()
+        
 
-            if 'eval' in log:
-                print(f'(E) | Epoch={epoch:04d}, avg_acc = {acc}')
+        
+        # DON'T NEED TO TRAIN TO GET THE EMBEDDINGS
+        # acc = test(final=True)
 
-    acc = test(final=True)
+        # if 'final' in log:
+        #     print(f'{acc}')
 
-    if 'final' in log:
-        print(f'{acc}')
+
+    # ----------------End my Training ----------------------------
+
+    # encoder = Encoder(dataset.num_features, param['num_hidden'], get_activation(param['activation']),
+    #                   base_model=get_base_model(param['base_model']), k=param['num_layers']).to(device)
+    # model = GRACE(encoder, param['num_hidden'], param['num_proj_hidden'], param['tau']).to(device)
+    # optimizer = torch.optim.Adam(
+    #     model.parameters(),
+    #     lr=param['learning_rate'],
+    #     weight_decay=param['weight_decay']
+    # )
+
+    # if param['drop_scheme'] == 'degree':
+    #     drop_weights = degree_drop_weights(data.edge_index).to(device)
+    # elif param['drop_scheme'] == 'pr':
+    #     drop_weights = pr_drop_weights(data.edge_index, aggr='sink', k=200).to(device)
+    # elif param['drop_scheme'] == 'evc':
+    #     drop_weights = evc_drop_weights(data).to(device)
+    # else:
+    #     drop_weights = None
+
+    # if param['drop_scheme'] == 'degree':
+    #     edge_index_ = to_undirected(data.edge_index)
+    #     node_deg = degree(edge_index_[1])
+    #     if args.dataset == 'WikiCS':
+    #         feature_weights = feature_drop_weights_dense(data.x, node_c=node_deg).to(device)
+    #     else:
+    #         feature_weights = feature_drop_weights(data.x, node_c=node_deg).to(device)
+    # elif param['drop_scheme'] == 'pr':
+    #     node_pr = compute_pr(data.edge_index)
+    #     if args.dataset == 'WikiCS':
+    #         feature_weights = feature_drop_weights_dense(data.x, node_c=node_pr).to(device)
+    #     else:
+    #         feature_weights = feature_drop_weights(data.x, node_c=node_pr).to(device)
+    # elif param['drop_scheme'] == 'evc':
+    #     node_evc = eigenvector_centrality(data)
+    #     if args.dataset == 'WikiCS':
+    #         feature_weights = feature_drop_weights_dense(data.x, node_c=node_evc).to(device)
+    #     else:
+    #         feature_weights = feature_drop_weights(data.x, node_c=node_evc).to(device)
+    # else:
+    #     feature_weights = torch.ones((data.x.size(1),)).to(device)
+
+    # log = args.verbose.split(',')
+
+    # for epoch in range(1, param['num_epochs'] + 1):
+    #     loss = train()
+    #     if 'train' in log:
+    #         print(f'(T) | Epoch={epoch:03d}, loss={loss:.4f}')
+
+    #     if epoch % 100 == 0:
+    #         acc = test()
+
+    #         if 'eval' in log:
+    #             print(f'(E) | Epoch={epoch:04d}, avg_acc = {acc}')
+
+    # acc = test(final=True)
+
+    # if 'final' in log:
+    #     print(f'{acc}')

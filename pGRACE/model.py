@@ -44,6 +44,12 @@ class Encoder(nn.Module):
                 u = sum(hs)
                 hs.append(self.activation(self.conv[i](u, edge_index)))
             return hs[-1]
+        
+    def weight_init(self, m):
+        if isinstance(m, GCNConv):
+            torch.nn.init.xavier_uniform(m.weight.data)
+            if m.bias is not None:
+                m.bias.data.fill_(0.0)
 
 
 class GRACE(torch.nn.Module):
@@ -59,6 +65,12 @@ class GRACE(torch.nn.Module):
 
     def forward(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
         return self.encoder(x, edge_index)
+    
+    def weight_init(self, m):
+        if isinstance(m, nn.Linear):
+            torch.nn.init.xavier_uniform(m.weight.data)
+            if m.bias is not None:
+                m.bias.data.fill_(0.0)
 
     def projection(self, z: torch.Tensor) -> torch.Tensor:
         z = F.elu(self.fc1(z))
@@ -110,7 +122,7 @@ class GRACE(torch.nn.Module):
         ret = (l1 + l2) * 0.5
         ret = ret.mean() if mean else ret.sum()
 
-        return ret
+        return ret, h1, h2
 
 
 class LogReg(nn.Module):

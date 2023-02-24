@@ -3,7 +3,7 @@ import os.path as osp
 from torch_geometric.datasets import Planetoid, CitationFull, WikiCS, Coauthor, Amazon
 import torch_geometric.transforms as T
 
-from ogb.nodeproppred import PygNodePropPredDataset
+# from ogb.nodeproppred import PygNodePropPredDataset
 
 def get_dataset(path, name):
     assert name in ['Cora', 'CiteSeer', 'PubMed', 'DBLP', 'Karate', 'WikiCS', 'Coauthor-CS', 'Coauthor-Phy',
@@ -26,8 +26,8 @@ def get_dataset(path, name):
     if name == 'Amazon-Photo':
         return Amazon(root=path, name='photo', transform=T.NormalizeFeatures())
 
-    if name.startswith('ogbn'):
-        return PygNodePropPredDataset(root=osp.join(root_path, 'OGB'), name=name, transform=T.NormalizeFeatures())
+    # if name.startswith('ogbn'):
+    #     return PygNodePropPredDataset(root=osp.join(root_path, 'OGB'), name=name, transform=T.NormalizeFeatures())
 
     return (CitationFull if name == 'dblp' else Planetoid)(osp.join(root_path, 'Citation'), name, transform=T.NormalizeFeatures())
 
