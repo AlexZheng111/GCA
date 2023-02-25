@@ -24,6 +24,13 @@ from pGRACE.util_xgoal import *
 from GPUtil import showUtilization as gpu_usage
 import gc, functools
 
+def plot_similarities(similarities, labels, bins):
+    for i, sim in enumerate(similarities):
+        plt.hist(sim, bins=bins, density=True, alpha=0.5, label=labels[i])
+    plt.legend()
+    plt.xlabel('Cosine Similarity')
+    plt.ylabel('Density')
+    plt.show()
 
 def train():
     model.train()
@@ -153,8 +160,6 @@ if __name__ == '__main__':
     ft_size = features.shape[1]
     nb_classes = labels.shape[1]
 
-    gpu_usage()
-
     adj_list = [normalize_adj(adj) for adj in adj_list]
     adj_list = [torch.FloatTensor(adj) for adj in adj_list]
     features = torch.FloatTensor(features)
@@ -165,9 +170,10 @@ if __name__ == '__main__':
 
     features = features.to(args.device)
     adj_list = [adj.to(args.device) for adj in adj_list]
-    adj_list = adj_list[2:]
     n_adj = len(adj_list)
-    gpu_usage()
+
+    similarities = [numpy.random.normal(i, 1, ft_size) for i in range(n_adj)]
+    plot_similarities(similarities, labels=['1', '2', '3'], bins=100)
     
     # --------------- Original Dataset Gathering ------------------
     # path = osp.expanduser('~/datasets')
@@ -272,11 +278,11 @@ if __name__ == '__main__':
         #             print(type(obj), obj.size())
         #     except:
         #         pass
-    plt.hist(similarities, bins=100, density=True, alpha=0.8, label=['TN1', 'FN2', 'TN2', 'FN2', 'TN3', 'FN3'])
-    plt.legend()
-    plt.xlabel('Cosine Similarity')
-    plt.ylabel('Density')
-    plt.show()
+    # plt.hist(similarities, bins=100, density=True, alpha=0.8, label=['TN1', 'FN2', 'TN2', 'FN2', 'TN3', 'FN3'])
+    # plt.legend()
+    # plt.xlabel('Cosine Similarity')
+    # plt.ylabel('Density')
+    # plt.show()
         
 
         
